@@ -38,6 +38,26 @@ Flag is almost certainly a file on the box (prior hiCTF `titan-relay` read `/fla
 - "Tracking token is secret and only shown to the person who placed the order"
 - "Treat persisted bag state as untrusted client data"
 
+## SESSION 2 findings (instance 0ad7577c461b, later expires)
+- Backend is **Apache/2.4.69 (Debian) on port 7107** behind the hiCTF instancer (Host-routed). REST-style codes (201/404/422/403/416).
+- **Routes are exactly 4**: `menu` (GET), `order` (GET=track / POST=create), `newsletter` (POST), `health` (GET → `{"ok":true,"service":"ember-and-oak"}`). GET- and POST-brute of ~500 words each found nothing else. No param-gated route surfaced.
+- **Auth binding is perfect**: cross-order id/token rejected; prefix/substring/empty/concat token rejected; case-sensitive exact id. No type-juggle, no SQLi (clean Python payloads in id/token/name/note/email — quotes stored & echoed verbatim ⇒ parameterized/file store).
+- **Tokens**: harvested 64 orders. ids = random 32-bit (`EO-`+8 hex), tokens = 192-bit full-entropy (`random_bytes`). No id→token derivation (md5/sha1/sha256 of id/full tested), no ordering, no collisions ⇒ **not predictable**.
+- **Mass-assignment**: server rebuilds order; injected id/token/status/total/discount/role ignored.
+- **promo**: only `FIRSTSIP` valid (brute 936 themed codes). It's `strcasecmp(trim($promo),'FIRSTSIP')` → 10% off; `\u0000`/`\n`/`\t`/spaces trimmed; internal NUL & traversal & SSTI all invalid. Not an LFI/oracle beyond code validity.
+- **pickup** whitelisted asap/30/45/60 (no date sink). **newsletter** POST-only, generic ok msg, no dedup oracle, email filter_var-validated, no SQLi.
+- **note IS returned on track** (with valid id+token) — so reading an order = reading its note (the token would live there), but roaster order's id+token unknown & unguessable.
+- **No SSTI** (name/note echoed verbatim), **no XXE** (XML rejected "Expected JSON request."), **no 500/stack traces**, **no reflection**, **no cookies/sessions ever set**.
+- **File read**: `/flag.txt`,`/flag`,`/flag.php`,`/flag.html`,`/README.md`,`/.env`,`/.git/*`,`/.ht*`,`/server-status` → **403** (Apache deny; `.git/*` 403 even for nonexistent paths ⇒ Directory deny, git NOT dumpable). Random missing files/dotfiles → 404. Flag almost certainly at `/flag.txt`, blocked at Apache layer.
+- **Apache bypasses tried & failed**: encoded dots/slashes (`%2e`,`%2f`,`..%2f`,`....//`,`%252e`), `--path-as-is` traversal, trailing `%00`/`;`/`%23`/space, case, `index.php/../`. Deny applies post-normalization to final segment.
+- No per-order web artifacts (`/orders/<id>`, `/receipts/...`), no admin tooling (adminer/pma), no sourcemaps, no hidden assets, CSS/JS clean.
+
+## CONCLUSION (session 2): standard black-box surface is exhausted & hardened.
+Remaining plausible intended vulns (need source or heavier tooling):
+1. **HTTP request smuggling / proxy desync** between the HTTP/2 instancer front and backend Apache 2.4.69 → reach an internal-only "ledger" endpoint ("not on the menu" = internal). Hard to drive reliably via curl here.
+2. A subtle logic/crypto flaw only visible in **source** (hiCTF challenges often ship a handout zip — worth getting).
+3. Time-gated "after-hours" behavior we can't trigger (server clock not controllable). It IS currently after-hours (server UTC, shop opens 8am) and nothing unlocked.
+
 ## Ideas to try next (fresh instance)
 1. Re-run storage-detection: `id = x/../EO-<id>` with CORRECT token — if it returns the order, storage is naive
    per-id file concat => path traversal to read `../ledger.json` / `/flag.txt` (must yield valid order-ish JSON, or token gate bypass).
