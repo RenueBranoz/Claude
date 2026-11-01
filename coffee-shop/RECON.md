@@ -58,6 +58,20 @@ Remaining plausible intended vulns (need source or heavier tooling):
 2. A subtle logic/crypto flaw only visible in **source** (hiCTF challenges often ship a handout zip — worth getting).
 3. Time-gated "after-hours" behavior we can't trigger (server clock not controllable). It IS currently after-hours (server UTC, shop opens 8am) and nothing unlocked.
 
+## SESSION 3 additions (all negative)
+- Order endpoint param-mine (GET track + no-id) across ~80 param names: no hidden param changes behavior.
+- null-token hypothesis: brute ~100 themed/numeric ledger ids with token omitted / `token=null` / `token[]=` → 0 hits.
+- nginx alias off-by-slash + front/back path discrepancy (`/assets../`, `/assets..%2f`, `%2e%2e`, `..;/`, `..%00/`) → 404/403, no flag read.
+- WebDAV: PROPFIND/PROPPATCH/REPORT/MKCOL/COPY/MOVE/LOCK/SEARCH on `/` all return the homepage (PHP ignores method); on `/assets/` → 405. TRACE → 405. No listing. OPTIONS → no Allow/DAV header.
+- Direct backend ports (7107/8443/8080/80) unreachable (egress is 443-only; connection reset / no-resolve).
+- Host header rewrite → instancer "no instance" page (front routes by Host). X-Forwarded-*/Forwarded → no effect.
+- Menu: exactly 9 products, categories {coffee,tea,bakery,kitchen} only, no extra fields, no hidden category/product.
+- Headers everywhere: `cache-control: no-store`, `x-content-type-options: nosniff`, `x-powered-by: PHP/8.4.26`, `server: Apache/2.4.69 (Debian) ... Port 7107`. No auth token / cookie / Link / X-* leak. Roaster email in order = neutral.
+- health is static `{"ok":true,"service":"ember-and-oak"}` under all params/methods.
+
+## STRONGEST REMAINING HYPOTHESIS
+An internal/after-hours-gated endpoint (the "ledger") that the front-proxy hides or that the app restricts by source/header — reachable only by **HTTP request smuggling** (desync instancer↔Apache) to bypass the front proxy's header handling. Could NOT attempt from this sandbox: proxy credentials/raw-socket access are blocked by the environment classifier, and the backend isn't directly reachable. Needs either source (to confirm the gate + route) or a less-restricted testing box.
+
 ## Ideas to try next (fresh instance)
 1. Re-run storage-detection: `id = x/../EO-<id>` with CORRECT token — if it returns the order, storage is naive
    per-id file concat => path traversal to read `../ledger.json` / `/flag.txt` (must yield valid order-ish JSON, or token gate bypass).
