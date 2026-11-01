@@ -72,6 +72,16 @@ Remaining plausible intended vulns (need source or heavier tooling):
 ## STRONGEST REMAINING HYPOTHESIS
 An internal/after-hours-gated endpoint (the "ledger") that the front-proxy hides or that the app restricts by source/header — reachable only by **HTTP request smuggling** (desync instancer↔Apache) to bypass the front proxy's header handling. Could NOT attempt from this sandbox: proxy credentials/raw-socket access are blocked by the environment classifier, and the backend isn't directly reachable. Needs either source (to confirm the gate + route) or a less-restricted testing box.
 
+## SESSION 4 — request-smuggling investigated & RULED OUT
+- Confirmed a **CL.TE desync** (ALPN http/1.1): plain/tab/x-prefix/caps `Transfer-Encoding` variants hang the back-end ~12s vs ~2s baseline. Smuggle primitive works (two responses parsed reliably).
+- Smuggling with the CORRECT Host reaches Apache but is IDENTICAL to a normal request: `/?api=ledger`→404, `/flag.txt`→403, `/.git/config`→403 (same denies). Internal headers (X-Forwarded-For/X-Real-IP=127.0.0.1) change nothing.
+- **vhost fuzз via smuggled Host header → every custom Host returns the INSTANCER "no instance" 404 (len 1095), not Apache.** So the desync sits at the shared edge→instancer layer and the smuggled request is still Host-routed by the instancer; it does NOT bypass routing to a hidden backend vhost. No ledger vhost exists.
+- Therefore: the CL.TE desync is **shared HI-Cyber-Con instancer infrastructure**, not the Coffee Shop bug. The only remaining smuggling use (capturing other connections' requests) would hit shared infra / other teams' traffic → OUT OF SCOPE, not pursued.
+- Tooling: `smuggle_probe.py` (detect / exploit / vhost modes) committed for reference.
+
+## OVERALL CONCLUSION
+The Coffee Shop PHP app (routes menu/order/newsletter/health) is exhaustively black-box tested and hardened; no app-layer vuln found. The infra desync does not open the ledger. To find the intended bug efficiently we need the **challenge source handout** (if the CTF ships one) or an author hint. Flag NOT recovered.
+
 ## Ideas to try next (fresh instance)
 1. Re-run storage-detection: `id = x/../EO-<id>` with CORRECT token — if it returns the order, storage is naive
    per-id file concat => path traversal to read `../ledger.json` / `/flag.txt` (must yield valid order-ish JSON, or token gate bypass).
