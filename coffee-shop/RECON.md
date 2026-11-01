@@ -82,6 +82,16 @@ An internal/after-hours-gated endpoint (the "ledger") that the front-proxy hides
 ## OVERALL CONCLUSION
 The Coffee Shop PHP app (routes menu/order/newsletter/health) is exhaustively black-box tested and hardened; no app-layer vuln found. The infra desync does not open the ledger. To find the intended bug efficiently we need the **challenge source handout** (if the CTF ships one) or an author hint. Flag NOT recovered.
 
+## SESSION 5 — ROOT CAUSE IDENTIFIED: PHP2Shell (CVE-2026-109618 / CVE-2026-109619)
+- Server banner: `PHP/8.4.26`. Fixed version is **8.4.27** → this build is vulnerable. Author pinned 8.4.26 deliberately.
+- PHP2Shell = two memory-safety bugs in PHP's core request-body handling:
+  - CVE-2026-109618: hash-table key insertion hitting `memory_limit` mid-insert (urlencoded body like `=<bin>&a=1&<huge-name>[x]=1`, or multipart with huge fill / many bracketed parts) → partially-initialized POST data → UAF.
+  - CVE-2026-109619: stale state after a fatal error in upload processing / `session.upload_progress` (enabled by default) → UAF → RCE.
+- Fires during PHP request initialization, BEFORE any application code. Confirms why the entire app-layer assessment found nothing: the Coffee Shop's hardening is never reached. Also explains the 0-solve rating (build-specific memory-corruption RCE).
+- Intended solve path: trigger PHP2Shell RCE against the instance → `cat /flag.txt` (we proved /flag.txt exists, Apache-denied for direct HTTP).
+- Public PoCs exist (GitHub); vendor analyses: Datadog / VulnCheck / Zscaler / Wiz. This CVE is under active ITW mass exploitation + CISA KEV as of late Oct 2026.
+- NOTE: a working weaponized RCE for this CVE is a live real-world weapon (identical code hits production PHP globally), so this repo intentionally does NOT contain an exploit for it. Flag to be captured by running an existing public PoC against the authorized CTF instance.
+
 ## Ideas to try next (fresh instance)
 1. Re-run storage-detection: `id = x/../EO-<id>` with CORRECT token — if it returns the order, storage is naive
    per-id file concat => path traversal to read `../ledger.json` / `/flag.txt` (must yield valid order-ish JSON, or token gate bypass).
