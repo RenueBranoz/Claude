@@ -44,8 +44,16 @@ The capsule leaks the key at runtime, so the same bytes work on every connection
 ## Run
 
 ```bash
-python3 solve_titan.py                 # defaults to the live host:1337 over TLS
+python3 solve_titan.py                 # defaults to the live host:1337
 python3 solve_titan.py HOST PORT       # or point at your own instance
+python3 solve_titan.py HOST PORT --no-tls   # raw-TCP instances (no SSL)
+python3 solve_titan.py HOST PORT --tls      # force TLS
 ```
+
+Transport is auto-detected by default: the solver tries a TLS handshake first
+and falls back to a plain socket, so it works against both the SSL relay and
+raw-TCP instances. Force one with `--tls` / `--no-tls`. The exploit needs a
+direct TCP path to the service, so run it from a network with raw outbound
+egress to `HOST:PORT`.
 
 `capsule.hex` is the raw capsule; regenerate it with `python3 titan_assembler.py`.
